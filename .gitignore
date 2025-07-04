@@ -26,3 +26,9 @@ checkpoints/
 notebooks/
 results/
 *.slurm
+model_save
+snapshot_download.py
+my_data
+.cache
+dataset_dir
+output_model

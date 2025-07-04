@@ -1,134 +1,109 @@
+from typing import Any
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from datasets import load_from_disk
+from transformers import AutoTokenizer
+
+from models.processors import get_tokenizer, get_image_processor
+from models.config import VLMConfig
 
 
-class BaseDataset(Dataset):
-    def __init__(self, dataset, tokenizer, image_processor, mp_image_token_length):
-        self.dataset = dataset
-        self.tokenizer = tokenizer
-        self.image_processor = image_processor
-        self.mp_image_token_length = mp_image_token_length
+def convert_to_chat_meessages(
+    messages: list[dict, str], image_pad_str: str = "<image>\n"
+):
+    """
+    转换为openai对话模板以应用chat template
+    """
+    messages = messages.copy()
+    for msg in messages:
+        if msg["role"] == "user":
+            content: str = msg["content"]
+            img_index = content.find(image_pad_str)
+            img_cnt = content.count(image_pad_str)
+            content = content.replace(image_pad_str, "")
+            contents = []
+            if img_index == 0:
+                contents.extend([{"type:": "image", "image": ""}] * img_cnt)
+                contents.append({"type:": "text", "text": content})
+            elif img_cnt > 0:
+                contents.append({"type:": "text", "text": content})
+                contents.extend([{"type:": "image", "image": ""}] * img_cnt)
 
-        self.prefix_len = self._get_prefix_len()
+            msg["content"] = contents
+    return messages
+
+
+def vlm_input_apply_chat_templat_for_training(
+    tokenizer: AutoTokenizer,
+    messages: list[dict[str, str | list]],
+    mp_image_token_length: int = 64,
+    enable_thinking: bool = False,
+):
+
+    messages = convert_to_chat_meessages(messages)
+    text: str = tokenizer.apply_chat_template(
+        messages[0:-1],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking,
+    )
+
+    image_token = tokenizer.image_token
+    while image_token in text:
+        text = text.replace(image_token, "<|placeholder|>" * mp_image_token_length, 1)
+    text = text.replace("<|placeholder|>", image_token)
+
+    prompt_tokens = tokenizer(text, return_attention_mask=False)["input_ids"]
+    response_tokens = tokenizer(
+        messages[-1]["content"],
+        add_special_tokens=False,
+    )["input_ids"]
+
+    eos_token_id = tokenizer.eos_token_id
+    input_ids = prompt_tokens + response_tokens + [eos_token_id]
+    labels = [-100] * len(prompt_tokens) + response_tokens + [eos_token_id]
+
+    return input_ids, labels
+
+
+class VQADataset(Dataset):
+    def __init__(
+        self,
+        dataset_dir: str,
+        config: VLMConfig,
+        train_max_token_length: int = 1024,
+    ):
+        super().__init__()
+        self.config = config
+        self.tokenizer = get_tokenizer(
+            config.lm_pretrain_path, config.vlm_extra_tokens, config.lm_chat_template
+        )
+        self.image_processor = get_image_processor(config.vm_input_image_size)
+        self.max_length = train_max_token_length
+        self.imgage_token_length = config.vm_image_token_length
+
+        self.dataset = load_from_disk(dataset_dir)
 
     def __len__(self):
         return len(self.dataset)
 
-    def _get_prefix_len(self):
-        random_string_5_letters = "xzyvd"
-        random_string_chat_templated = self.tokenizer.apply_chat_template([{"role": "assistant", "content": random_string_5_letters}], tokenize=False, add_special_tokens=False)
-        random_string_location = random_string_chat_templated.find(random_string_5_letters)
-        return len(self.tokenizer.encode(random_string_chat_templated[:random_string_location]))
+    def __getitem__(self, index):
+        """ """
 
-    def _get_messages(self, item, image_count=0):
-        messages = []
-        for text in item['texts']:
-            messages.append({"role": "user", "content": text['user']})
-            messages.append({"role": "assistant", "content": text['assistant']})
+        row = self.dataset[index]
+        inputs = row["inputs"]
+        image = row["images"][0]
+        input_ids, labels = inputs["input_ids"], inputs["labels"]
 
-        if image_count > 0:
-            messages[0]["content"] = self.tokenizer.image_token * image_count * self.mp_image_token_length + messages[0]["content"]      
+        if len(input_ids) > self.max_length:
+            input_ids = input_ids[0 : self.max_length]
+            labels = labels[0 : self.max_length]
 
-        return messages
+        images = self.image_processor(image)
 
-    def _process_images(self, images):
-        processed_images = []
-        for image in images:
-            if isinstance(image, Image.Image):
-                if image.mode != 'RGB':
-                    image = image.convert('RGB')
-                processed_image = self.image_processor(image)
-                processed_images.append(processed_image)
-            else:
-                raise ValueError("Error processing image")
-        return processed_images
-
-
-    def _prepare_inputs_and_loss_mask(self, messages):
-        conv_ids = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_special_tokens=False,
-            return_dict=True,
+        return dict(
+            input_ids=input_ids,
+            labels=labels,
+            images=images,
         )
-        mask = [0] * len(conv_ids["input_ids"])
-
-        # Locate each assistant turn and flip its mask to 1
-        cursor = 0
-        for msg in messages:
-            segment_ids = self.tokenizer.apply_chat_template(
-                [msg], tokenize=True, add_special_tokens=False
-            )
-            seg_len = len(segment_ids)
-
-            if msg["role"] == "assistant":
-                start = cursor + self.prefix_len
-                end   = cursor + seg_len
-                mask[start:end] = [1] * (end - start)  # attend to these tokens
-
-            cursor += seg_len
-        
-        return torch.tensor(conv_ids["input_ids"]), torch.tensor(mask).to(torch.bool), torch.tensor(conv_ids["attention_mask"])
-
-
-class VQADataset(BaseDataset):  # Visual Question Answering Dataset
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-
-        # Handle images (should be a list)
-        images_data = item['images']
-        if not isinstance(images_data, list):
-            images_data = [images_data]
-
-        # Now process the images
-        processed_images = self._process_images(images_data)
-
-        messages = self._get_messages(item, len(processed_images))
-
-        input_ids, mask, attention_mask = self._prepare_inputs_and_loss_mask(messages)
-        labels = self._get_labels(input_ids, mask)
-
-        return {
-            "images": processed_images,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-
-    def _get_labels(self, input_ids, mask):
-        labels = input_ids.clone().masked_fill(~mask, -100)
-        labels = labels.roll(-1) # Shift labels for causal LM
-        labels[-1] = -100 # Last token has no target
-        
-        return labels
-
-class MMStarDataset(BaseDataset):  # https://huggingface.co/datasets/Lin-Chen/MMStar
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-        
-        image = item['image']
-        processed_images = self._process_images([image])
-        
-        item['texts'] = [{
-            "user": item['question'] +  "\nAnswer only with the letter!",
-            "assistant": item['answer']
-        }]
-        messages = self._get_messages(item, image_count=len(processed_images))
-
-        input_ids, mask, attention_mask = self._prepare_inputs_and_loss_mask(messages)
-        labels = self._get_labels(input_ids, mask)
-        input_ids = input_ids.masked_fill(mask, self.tokenizer.pad_token_id)
-        attention_mask = attention_mask.masked_fill(mask, 0)
-
-        return {
-            "images": processed_images,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-
-    def _get_labels(self, input_ids, mask):
-        labels = input_ids.clone().masked_fill(~mask, self.tokenizer.pad_token_id)
-        return labels
-

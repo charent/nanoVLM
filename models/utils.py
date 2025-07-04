@@ -1,12 +1,15 @@
+import json
 import re
+from pathlib import Path
 import torch
+
 
 # Used to check our models performance on multiple choice tasks. This can also be done in a more involved way with e.g. LLM-as-a-judge
 def check_multiple_choice_with_regex(model_outputs, correct_answers):
     results = []
     for model_output, correct_answer in zip(model_outputs, correct_answers):
         # Strip any trailing newlines and convert to uppercase
-        correct_answer = correct_answer.rstrip('\n').upper()
+        correct_answer = correct_answer.rstrip("\n").upper()
 
         # Look for the answer letter at the beginning of a line or as the last word
         patterns = [
@@ -24,7 +27,7 @@ def check_multiple_choice_with_regex(model_outputs, correct_answers):
     return results
 
 
-def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float('Inf')):
+def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float("Inf")):
     """
     Apply top-k and/or nucleus (top-p) filtering to logits.
     """
@@ -44,8 +47,70 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-float('Inf')
 
         # Always keep the first token
         sorted_indices_to_remove[..., 0] = False
-        
-        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+
+        indices_to_remove = sorted_indices_to_remove.scatter(
+            1, sorted_indices, sorted_indices_to_remove
+        )
         logits = logits.masked_fill(indices_to_remove, filter_value)
 
     return logits
+
+
+def read_text(file: str) -> str:
+    data = ""
+    with open(Path(file), "r", encoding="utf-8") as f:
+        data = f.read()
+    return data
+
+
+def read_text_lines(file: str) -> list[str]:
+    data = []
+    with open(Path(file), "r", encoding="utf-8") as f:
+        data = f.readlines()
+    return data
+
+
+def read_text_lines_no_empty_line(file: str) -> list[str]:
+    data = []
+    with open(Path(file), "r", encoding="utf-8") as f:
+        data = f.readlines()
+    return [line.strip() for line in data if len(line.strip()) > 0]
+
+
+def save_json(obj: dict, file: str) -> None:
+    with open(file, "w", encoding="utf-8") as f:
+        json.dump(obj, fp=f, ensure_ascii=False, indent=4)
+
+
+def read_json(file: str) -> dict | list[dict]:
+    data = []
+    with open(file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data
+
+
+def save_to_jsonl(data: list[dict], file: str):
+    str_data = [f"{json.dumps(item, ensure_ascii=False)}\n" for item in data]
+    with open(file, "w", encoding="utf-8") as f:
+        f.writelines(str_data)
+
+
+def read_jsonl(file: str) -> list[dict]:
+    data = []
+    with open(file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if len(line) == 0:
+                continue
+            data.append(json.loads(line))
+    return data
+
+
+def save_text_list(data: list[str], file: str):
+    with open(file, "w", encoding="utf-8") as f:
+        f.writelines(data)
+
+
+def save_text(data: str, file: str):
+    with open(file, "w", encoding="utf-8") as f:
+        f.write(data)
